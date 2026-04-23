@@ -68,7 +68,10 @@
 #include "tensorrt_llm/runtime/utils/runtimeUtils.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -2230,6 +2233,39 @@ bool batchReturnLogProbs(ScheduledRequests const& scheduledRequests)
     return std::any_of(scheduledRequests.contextRequests.begin(), scheduledRequests.contextRequests.end(), pred)
         || std::any_of(scheduledRequests.generationRequests.begin(), scheduledRequests.generationRequests.end(), pred);
 }
+
+// ---------------------------------------------------------------------------
+// Process-wide counters & throttled logging for beam-search hard cutoff.
+//
+// Placed in an anonymous namespace (TU-local, no external linkage) instead of
+// as function-local `static` so:
+//   - the initialization/lifetime is explicit and easy to audit,
+//   - unit tests / tools can see these symbols without reaching into a function,
+//   - later we can trivially promote them to class members if per-model stats
+//     are ever needed.
+//
+// Both are accessed only with std::memory_order_relaxed because they serve
+// *observability* purposes only - no other thread relies on these values for
+// correctness / ordering.
+// ---------------------------------------------------------------------------
+std::atomic<std::uint64_t> gBeamCutoffTotal{0};
+std::atomic<std::int64_t> gBeamCutoffLastWarnNs{0};
+constexpr std::int64_t kBeamCutoffWarnIntervalNs = 1'000'000'000LL; // 1 s
+
+// Returns the (post-increment) total count, and writes `outShouldWarn=true`
+// at most once per kBeamCutoffWarnIntervalNs across the whole process.
+std::uint64_t recordBeamCutoffAndMaybeWarn(bool& outShouldWarn) noexcept
+{
+    auto const total = gBeamCutoffTotal.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    auto const nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    auto last = gBeamCutoffLastWarnNs.load(std::memory_order_relaxed);
+    outShouldWarn = (nowNs - last > kBeamCutoffWarnIntervalNs)
+        && gBeamCutoffLastWarnNs.compare_exchange_strong(last, nowNs, std::memory_order_relaxed);
+    return total;
+}
 } // namespace
 
 runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledRequests const& scheduledRequests)
@@ -2473,8 +2509,12 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             auto const finishReason = finishReasonsHostData[seqSlot * mOperatingBeamWidth + beam];
             llmReq->setFinishedReason(finishReason.toFinishReason(), beam);
 
+            // NOTE: TLLM_LOG_DEBUG expands to `if (logger->isEnabled(DEBUG)) { ... }`,
+            // so __VA_ARGS__ (including vec2str(getTokens(beam))) is only evaluated
+            // when DEBUG level is active. No outer guard is required.
             TLLM_LOG_DEBUG("[RANK %d] decoderSync: request ID %lu beam %d tokens %s finished %d",
-                COMM_SESSION.getRank(), llmReq->mRequestId, beam, common::vec2str(llmReq->getTokens(beam)).c_str(),
+                COMM_SESSION.getRank(), llmReq->mRequestId, beam,
+                common::vec2str(llmReq->getTokens(beam)).c_str(),
                 static_cast<int>(finishReason.toFinishReason()));
         }
 
@@ -2536,32 +2576,152 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         auto const maxNumGenerated = llmReq->getMaxNumGeneratedTokens();
         auto const decodingIter = llmReq->getDecodingIter();
 
-        // Hard cutoff: force-terminate when generation steps reach maxNewTokens.
-        // Use decodingIter (actual iteration count) instead of getMaxNumGeneratedTokens()
-        // because in beam search, mTokens may not grow (beam reordering can cause
-        // numNewOutputTokens==0), making getMaxNumGeneratedTokens() unreliable.
-        bool const hardMaxTokensCutoff = (decodingIter >= llmReq->mMaxNewTokens);
-        if (hardMaxTokensCutoff && decoderFinishedSumPtr[seqSlot] != reqBeamWidth)
+        // ---- progress log (DEBUG only, and only near/at cutoff) ----------------
+        // Rationale: at beam_width=128 / QPS>>1 the per-request-per-step log
+        // below is too noisy even on the DEBUG channel. We only care about the
+        // last few iterations of each request (where cutoff logic is decided),
+        // so skip logging when the request is still far from its budget.
+        //
+        // NOTE: TLLM_LOG_DEBUG itself is already gated on isEnabled(DEBUG), so
+        // when logging is disabled the call is effectively free. This extra
+        // guard mainly reduces log volume when DEBUG *is* enabled.
+        constexpr SizeType32 kProgressLogWindow = 4;
+        bool const nearCutoff
+            = (maxNumGenerated + kProgressLogWindow >= llmReq->mMaxNewTokens)
+            || (decodingIter + kProgressLogWindow >= llmReq->mMaxNewTokens);
+        if (nearCutoff || decoderFinishedSumPtr[seqSlot] == reqBeamWidth)
         {
-            TLLM_LOG_WARNING(
-                "[decoderSync] request %lu: FORCE TERMINATING - decodingIter (%d) >= maxNewTokens (%d), "
-                "but finishedSum (%d) != reqBeamWidth (%d). Beam search did not converge within max_tokens limit.",
+            TLLM_LOG_DEBUG(
+                "[decoderSync] request %lu: promptLen=%d, maxBeamNumTokens=%d, "
+                "maxNewTokens=%d, maxNumGenerated=%d, decodingIter=%d, finishedSum=%d/%d, "
+                "willComplete=%d",
+                llmReq->mRequestId, llmReq->mPromptLen,
+                llmReq->getMaxBeamNumTokens(), llmReq->mMaxNewTokens,
+                maxNumGenerated, decodingIter,
+                decoderFinishedSumPtr[seqSlot], reqBeamWidth,
+                llmReq->willCompleteNextIteration() ? 1 : 0);
+        }
+
+        // ---- hard cutoff: two independent, cheap conditions --------------------
+        // Condition A (cutoffByIter): iteration counter reached the budget. This
+        //   is the ORIGINAL safety net and survives the beam-reorder corner case
+        //   where mTokens does not grow on a given step (numNewOutputTokens == 0).
+        // Condition B (cutoffByLength): token-length reached the budget.
+        //   getMaxNumGeneratedTokens() is "max generated tokens across all beams
+        //   of this request", so this fires as soon as the fastest beam has
+        //   written mMaxNewTokens generation tokens. Beam search steps all beams
+        //   in lock-step, so when this fires there is no point running one more
+        //   decoder iteration - every remaining beam would at best produce a
+        //   token that is immediately truncated by the length limit on the
+        //   Python side.
+        //
+        // NOTE: this cutoff terminates the ENTIRE request (all beams together),
+        // not a single beam branch. TRT-LLM beam search binds all beams of a
+        // request to a shared KV cache / runtime state and cannot free a single
+        // beam independently.
+        //
+        // Either condition alone is sufficient; we OR them so whichever triggers
+        // first wins. This typically saves exactly ONE decoder iteration per
+        // request at beam_width >> 1, which is non-trivial at beamWidth=128.
+        //
+        // Speculative-decoding note: under speculative decoding a single decoder
+        // iteration may accept N draft tokens, so `decodingIter` grows slower
+        // than `maxNumGenerated`. In that regime `cutoffByLength` is the primary
+        // trigger (it counts tokens, not iterations) and `cutoffByIter` only
+        // serves as a conservative lower-bound safety net - it can never fire
+        // *before* `cutoffByLength`, so it will not truncate prematurely.
+        bool const cutoffByIter = (decodingIter >= llmReq->mMaxNewTokens);
+        bool const cutoffByLength = (maxNumGenerated >= llmReq->mMaxNewTokens);
+        bool const hardMaxTokensCutoff = cutoffByIter || cutoffByLength;
+        // Defensive guard: skip if the request is already in a terminal state
+        // (e.g. kGENERATION_COMPLETE / kGENERATION_TO_COMPLETE set by a prior
+        // branch). Mirrors the same guard used by the early-TO_COMPLETE block
+        // below so both cutoff paths have symmetric defense-in-depth.
+        if (hardMaxTokensCutoff && decoderFinishedSumPtr[seqSlot] != reqBeamWidth
+            && !llmReq->isGenerationCompleteState())
+        {
+            // DEBUG by default: per-request details go to the debug channel only,
+            // so high-QPS workloads are not drowned in log I/O.
+            TLLM_LOG_DEBUG(
+                "[decoderSync] request %lu: FORCE TERMINATING "
+                "(iter=%d/%d, maxGen=%d/%d, finishedSum=%d/%d, byIter=%d, byLen=%d)",
                 llmReq->mRequestId, decodingIter, llmReq->mMaxNewTokens,
-                decoderFinishedSumPtr[seqSlot], reqBeamWidth);
+                maxNumGenerated, llmReq->mMaxNewTokens,
+                decoderFinishedSumPtr[seqSlot], reqBeamWidth,
+                cutoffByIter ? 1 : 0, cutoffByLength ? 1 : 0);
+
+            // Throttled WARN: emit at most once per second, aggregating how often
+            // this has happened process-wide, so operators still get a heads-up
+            // without log-spam. See helper in the anonymous namespace above.
+            bool shouldWarn = false;
+            auto const totalCutoffs = recordBeamCutoffAndMaybeWarn(shouldWarn);
+            if (shouldWarn)
+            {
+                TLLM_LOG_WARNING(
+                    "[decoderSync] beam-search hard cutoff fired %llu time(s) so far "
+                    "(latest: reqId=%lu, beamWidth=%d, finishedSum=%d). "
+                    "Consider lowering beam_width or enabling early-stopping.",
+                    static_cast<unsigned long long>(totalCutoffs),
+                    llmReq->mRequestId, reqBeamWidth, decoderFinishedSumPtr[seqSlot]);
+            }
+
             // Force all NOT_FINISHED beams to kLENGTH so Python layer won't raise
-            // "Unknown finish reason: FinishReason.NOT_FINISHED"
+            // "Unknown finish reason: FinishReason.NOT_FINISHED". Beams that
+            // already finished with kEND / kSTOP_WORDS keep their original reason.
+            //
+            // Outer `if` already guarantees finishedSum < reqBeamWidth, so at
+            // least one beam in this loop will actually be patched. We cache the
+            // row base pointer once to avoid recomputing `seqSlot * mOperatingBeamWidth`
+            // inside the loop body.
+            auto const* const beamFinishPtr = finishReasonsHostData + seqSlot * mOperatingBeamWidth;
             for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
             {
-                auto const gpuFinishState = finishReasonsHostData[seqSlot * mOperatingBeamWidth + beam];
-                if (!gpuFinishState.isFinished())
+                if (!beamFinishPtr[beam].isFinished())
                 {
                     llmReq->setFinishedReason(executor::FinishReason::kLENGTH, beam);
                 }
             }
         }
 
+        // ---- early TO_COMPLETE: save the NEXT decoder iteration -----------------
+        // If the fastest beam has already generated (mMaxNewTokens - 1) tokens, then
+        // the next decoder iteration is guaranteed to hit the hard cutoff above and
+        // have all its computed tokens either used (once) or truncated on the Python
+        // side. At beam_width=128 that next iteration is a very heavy kernel
+        // (softmax + topK over vocab * 128 + beam-search kernel). Flipping the
+        // request into kGENERATION_TO_COMPLETE NOW tells the scheduler to skip this
+        // request in the next microbatch, so we avoid one full decoder step per
+        // would-be-cutoff request.
+        //
+        // BEHAVIOR NOTE: TRT-LLM already has a similar optimization below, but it is
+        // gated on `isTrtOverlap()`. Since `enable_trt_overlap` defaults to false
+        // (see ExecutorConfig::mEnableTrtOverlap{false}), that branch is effectively
+        // dead code in most production deployments. This block EXTENDS the same
+        // kGENERATION_TO_COMPLETE fast-path to the non-overlap mode as well, which
+        // is where the beam_width=128 workload actually runs. It also adds a
+        // `decodingIter + 1 >= mMaxNewTokens` clause as a safety net for the
+        // beam-reorder corner case where `mTokens` does not grow on a given step.
+        //
+        // Guards:
+        //   - !hardMaxTokensCutoff: only act when we have NOT yet cut off (i.e. we
+        //     still have at least one more iter that would run)
+        //   - decoderFinishedSumPtr != reqBeamWidth: some beams still unfinished
+        //   - !isGenerationCompleteState(): not already in a terminal state
+        // We reuse the same kGENERATION_TO_COMPLETE state that isTrtOverlap uses
+        // below, so capacity/sequence scheduling semantics are unchanged.
+        if (!hardMaxTokensCutoff && decoderFinishedSumPtr[seqSlot] != reqBeamWidth
+            && !llmReq->isGenerationCompleteState()
+            && (maxNumGenerated + 1 >= llmReq->mMaxNewTokens || decodingIter + 1 >= llmReq->mMaxNewTokens))
+        {
+            TLLM_LOG_DEBUG(
+                "[decoderSync] request %lu: early TO_COMPLETE (maxGen=%d, iter=%d, mMaxNewTokens=%d) "
+                "- skipping one would-be-cutoff decoder iteration",
+                llmReq->mRequestId, maxNumGenerated, decodingIter, llmReq->mMaxNewTokens);
+            llmReq->setState(LlmRequestState::kGENERATION_TO_COMPLETE);
+        }
+
         // Terminate if request has finished or if it is speculative decoding target model
-        // or if hard max_tokens cutoff is reached
+        // or if hard max_tokens cutoff is reached (beam search safety net)
         if (decoderFinishedSumPtr[seqSlot] == reqBeamWidth
             || hardMaxTokensCutoff
             || (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens()))
