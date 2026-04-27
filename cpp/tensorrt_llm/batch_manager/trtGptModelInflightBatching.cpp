@@ -69,6 +69,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -855,12 +856,23 @@ void TrtGptModelInflightBatching::forwardSync()
             // Wait for decoding for requests in flight for the current micro batch
             auto& decoderWaitEvent = mDecoderFinishedEvents.at(mMicroBatchId);
             mDecStepAsyncSndHdls = decoderSync(currRequests, decoderWaitEvent);
+            // decoderSync already synchronized the wait event internally.
+            // Reset here so the next forwardAsync() observes
+            // `decoderFinishedEvent == nullopt`; if an exception unwinds
+            // before this line, the graceful-recovery branch at the top of
+            // forwardAsync() will synchronize and reset it.
             decoderWaitEvent.reset();
 
             if (!mWorldConfig.isLastPipelineParallelRank())
             {
+                // Non-last PP rank: ownership of mDecStepAsyncSndHdls is
+                // transferred to mAsyncSendWaitThread, which drains it
+                // before the next iteration's waitStop() returns.
                 mAsyncSendWaitThread->notifyStart();
             }
+            // Non-PP / single-rank path: communicateDecoderBuffers returns
+            // an empty vector (no downstream peer), so mDecStepAsyncSndHdls
+            // stays empty and the next iteration's nullptr check passes.
         }
         else
         {
@@ -1129,7 +1141,22 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             }
 
             auto& decoderFinishedEvent = mDecoderFinishedEvents.at(mMicroBatchId);
-            TLLM_CHECK_WITH_INFO(!decoderFinishedEvent.has_value(), "decoderFinishedEvent must be nullopt.");
+            // Graceful recovery: if decoderFinishedEvent still has a value, the previous
+            // decoderSync likely threw an exception (e.g. beam-search cutoff with an
+            // invalid sequenceLength) before decoderWaitEvent.reset() could run. We
+            // synchronize and reset it here instead of asserting, so that a single
+            // failing request does not cascade into permanent failure for every
+            // subsequent request in this micro batch slot.
+            if (decoderFinishedEvent.has_value())
+            {
+                TLLM_LOG_WARNING(
+                    "decoderFinishedEvent still has a value at the start of forwardAsync "
+                    "(microBatchId=%d). This indicates the previous decoderSync did not "
+                    "complete cleanly. Synchronizing and resetting to recover.",
+                    mMicroBatchId);
+                decoderFinishedEvent->synchronize();
+                decoderFinishedEvent.reset();
+            }
             decoderFinishedEvent = mWorldConfig.isLastPipelineParallelRank()
                 ? std::make_optional(decoderStepAsync(currRequests))
                 : std::nullopt;
@@ -1194,6 +1221,11 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 // Wait for decoding for requests in flight for the current micro batch
                 auto& decoderFinishedEvent = mDecoderFinishedEvents.at(mMicroBatchId);
                 mDecStepAsyncSndHdls = decoderSync(currRequests, decoderFinishedEvent);
+                // decoderSync already synchronized the event internally.
+                // Reset here so the next forwardAsync() observes
+                // `decoderFinishedEvent == nullopt`. On an exception path,
+                // the graceful-recovery branch at the top of the next
+                // forwardAsync() iteration synchronizes and resets it.
                 decoderFinishedEvent.reset();
 
                 mAsyncSendWaitThread->notifyStart();
@@ -1933,10 +1965,33 @@ void TrtGptModelInflightBatching::postProcessRequest(
     auto const maxSeqLength = outputIdsShape.d[1];
 
     std::vector<std::vector<TokenIdType>> generatedTokens(reqBeamWidth);
+    // Guard std::clamp with a well-formed [0, max] interval even in the
+    // pathological case where promptLen > maxSeqLength (upstream should
+    // reject such requests, but std::clamp requires lo <= hi).
+    auto const maxGeneratedLength
+        = std::max<SizeType32>(0, static_cast<SizeType32>(maxSeqLength - llmReq.mPromptLen));
     for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
     {
         auto const* const begin = outputIdsHostData + tc::flat_index2(beam, llmReq.mPromptLen, maxSeqLength);
-        auto const generatedLength = sequenceLengthsHostData[beam] - llmReq.mPromptLen;
+        auto generatedLength = sequenceLengthsHostData[beam] - llmReq.mPromptLen;
+        // Safety clamp: when beam search is force-terminated before
+        // convergence (e.g. by the hard cutoff below), gatherTree / finalize
+        // may produce out-of-range sequenceLengths for still-unfinished beams.
+        // Without this clamp, `generatedTokens[beam].assign(begin, end)` would
+        // throw "cannot create std::vector larger than max_size()", the
+        // exception would propagate out of decoderSync() and skip
+        // decoderWaitEvent.reset(), and the next forwardAsync() would then
+        // fail the `decoderFinishedEvent must be nullopt` assertion and
+        // permanently break the micro-batch slot.
+        if (generatedLength < 0 || generatedLength > maxGeneratedLength)
+        {
+            TLLM_LOG_DEBUG(
+                "[postProcessRequest] request %lu beam %d: clamping invalid generatedLength=%d "
+                "(seqLen=%d, promptLen=%d, maxSeqLen=%ld) to [0, %d].",
+                llmReq.mRequestId, beam, generatedLength, sequenceLengthsHostData[beam], llmReq.mPromptLen,
+                static_cast<long>(maxSeqLength), maxGeneratedLength);
+            generatedLength = std::clamp(generatedLength, static_cast<SizeType32>(0), maxGeneratedLength);
+        }
         auto const* const end = begin + generatedLength;
         generatedTokens[beam].assign(begin, end);
 
@@ -1952,8 +2007,176 @@ void TrtGptModelInflightBatching::postProcessRequest(
         }
     }
 
+    if (llmReq.getReturnGenerationLogits() && !llmReq.isStreaming())
+    {
+        reorderGenerationLogitsForBeamSearch(
+            llmReq, seqSlot, reqBeamWidth, maxSeqLength, outputIdsHostData, sequenceLengthsHostData);
+    }
+
     // store the generated tokens into the mTokensGathered buffer
     llmReq.setGeneratedTokens(generatedTokens);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void TrtGptModelInflightBatching::reorderGenerationLogitsForBeamSearch(LlmRequest& llmReq, SizeType32 seqSlot,
+    SizeType32 reqBeamWidth, SizeType32 maxSeqLength, TokenIdType const* outputIdsHostData,
+    SizeType32 const* sequenceLengthsHostData)
+{
+    // Reorder generation logits to match the gathered (finalized) beam ordering.
+    // During generation, logits are stored indexed by beam SLOT position. After beam search
+    // finalization (gatherTree), output_ids are reordered by tracing parentIds to reconstruct
+    // the correct beam paths. However, generation_logits are NOT reordered by gatherTree.
+    // We fix this here by tracing parentIds on the host to build the beam-slot mapping,
+    // then reindexing the logits accordingly.
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const promptLen = llmReq.mPromptLen;
+
+    auto parentIdsDevice = ITensor::at(mDecoderState->getParentIds(), {seqSlot});
+    auto idsDevice = mDecoderState->getIds(seqSlot);
+
+    auto parentIdsHost = runtime::BufferManager::pinnedPool(parentIdsDevice->getShape(), nvinfer1::DataType::kINT32);
+    auto idsHost = runtime::BufferManager::pinnedPool(idsDevice->getShape(), nvinfer1::DataType::kINT32);
+
+    mCopyBufferManager.copy(*parentIdsDevice, *parentIdsHost);
+    mCopyBufferManager.copy(*idsDevice, *idsHost);
+    mCopyBufferManager.getStream().synchronize();
+
+    auto const* parentIdsData = bufferCast<TokenIdType>(*parentIdsHost);
+    auto const* idsData = bufferCast<TokenIdType>(*idsHost);
+
+    auto const generationLogitsHost = llmReq.getGenerationLogitsHost();
+    auto const& logitsShape = generationLogitsHost->getShape();
+    TLLM_CHECK_WITH_INFO(logitsShape.d[0] == reqBeamWidth,
+        "Generation logits beam dimension (%ld) does not match beam width (%d).", logitsShape.d[0], reqBeamWidth);
+    auto const maxNewTokens = logitsShape.d[1];
+    auto const vocabSizePadded = logitsShape.d[2];
+
+    std::vector<std::vector<SizeType32>> slotTrace(reqBeamWidth, std::vector<SizeType32>(maxNewTokens, 0));
+    std::vector<SizeType32> genLens(reqBeamWidth, 0);
+    bool anyReorderNeeded = false;
+    bool canReliablyReorder = true;
+
+    for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
+    {
+        auto const seqLen = sequenceLengthsHostData[beam];
+        if (seqLen < promptLen)
+        {
+            canReliablyReorder = false;
+            break;
+        }
+        auto const genLen = std::min<SizeType32>(maxNewTokens, seqLen - promptLen);
+        genLens[beam] = genLen;
+        if (genLen <= 0)
+        {
+            continue;
+        }
+
+        SizeType32 startSlot = -1;
+        for (SizeType32 s = 0; s < reqBeamWidth; ++s)
+        {
+            SizeType32 slot = s;
+            bool matches = true;
+            for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+            {
+                if (idsData[slot * maxSeqLength + t] != outputIdsHostData[beam * maxSeqLength + t])
+                {
+                    matches = false;
+                    break;
+                }
+                if (t > promptLen)
+                {
+                    slot = parentIdsData[slot * maxSeqLength + t];
+                }
+            }
+            if (matches)
+            {
+                startSlot = s;
+                break;
+            }
+        }
+
+        if (startSlot < 0)
+        {
+            canReliablyReorder = false;
+            break;
+        }
+
+        SizeType32 slot = startSlot;
+        for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+        {
+            slot = parentIdsData[slot * maxSeqLength + t];
+            slotTrace[beam][t - promptLen] = slot;
+        }
+
+        auto& slotTraceIds = slotTrace[beam];
+        anyReorderNeeded |= std::any_of(
+            slotTraceIds.begin(), slotTraceIds.begin() + genLen, [beam](SizeType32 s) { return s != beam; });
+    }
+
+    if (!canReliablyReorder)
+    {
+        TLLM_LOG_WARNING(
+            "[postProcessRequest] request %lu: skipping beam-search generation logits reordering because "
+            "the gathered beam lineage could not be reconstructed reliably.",
+            llmReq.mRequestId);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return;
+    }
+
+    if (anyReorderNeeded)
+    {
+        auto const logitsDataType = generationLogitsHost->getDataType();
+        auto const elemSize = runtime::BufferDataType(logitsDataType).getSize();
+        auto const stepSize = static_cast<size_t>(vocabSizePadded) * elemSize;
+
+        auto tempLogits
+            = runtime::BufferManager::pinnedPool(ITensor::makeShape({reqBeamWidth, vocabSizePadded}), logitsDataType);
+
+        auto* logitsPtr = static_cast<uint8_t*>(generationLogitsHost->data());
+        auto* tempPtr = static_cast<uint8_t*>(tempLogits->data());
+
+        SizeType32 maxGenLen = 0;
+        for (SizeType32 b = 0; b < reqBeamWidth; ++b)
+        {
+            maxGenLen = std::max(maxGenLen, genLens[b]);
+        }
+
+        for (SizeType32 g = 0; g < maxGenLen; ++g)
+        {
+            bool stepNeedsReorder = false;
+            for (SizeType32 b = 0; b < reqBeamWidth; ++b)
+            {
+                if (g < genLens[b] && slotTrace[b][g] != b)
+                {
+                    stepNeedsReorder = true;
+                    break;
+                }
+            }
+            if (!stepNeedsReorder)
+            {
+                continue;
+            }
+
+            for (SizeType32 b = 0; b < reqBeamWidth; ++b)
+            {
+                auto const offset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+                std::memcpy(tempPtr + static_cast<size_t>(b) * stepSize, logitsPtr + offset, stepSize);
+            }
+
+            for (SizeType32 b = 0; b < reqBeamWidth; ++b)
+            {
+                if (g >= genLens[b])
+                {
+                    continue;
+                }
+                auto const dstOffset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+                auto const srcSlot = slotTrace[b][g];
+                std::memcpy(logitsPtr + dstOffset, tempPtr + static_cast<size_t>(srcSlot) * stepSize, stepSize);
+            }
+        }
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -2219,6 +2442,11 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         auto const reqBeamWidth = llmReq->getBeamWidthByIter(true);
         auto const seqSlot = llmReq->mSeqSlot.value();
         auto const currentNumOfTokens = llmReq->getMaxBeamNumTokens();
+        std::vector<SizeType32> currentNumTokensPerBeam(reqBeamWidth);
+        for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
+        {
+            currentNumTokensPerBeam[beam] = llmReq->getNumTokens(beam);
+        }
 
         // Save the accepted token logits from target model
         if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->getReturnGenerationLogits()
@@ -2237,6 +2465,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
 
         std::vector<SizeType32> numNewTokens(reqBeamWidth);
         std::vector<SizeType32> numDroppedTokens(reqBeamWidth);
+        bool const isBeamSearch = reqBeamWidth > 1;
 
         // numGeneratedTokens is the number of tokens generated by the decoder.
         // Some tokens might be dropped due to end token or rejected draft tokens.
@@ -2246,9 +2475,15 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         {
             // Sequence length is only advanced for accepted tokens.
             auto const seqLen = sequenceLengthsHostData[seqSlot * mOperatingBeamWidth + beam];
-            // Actual number of tokens that should be added to the request.
-            auto const numNewOutputTokens = seqLen - llmReq->getNumTokens(beam);
-            if (reqBeamWidth == 1)
+            // Actual number of tokens that should be added to the request. Use
+            // the pre-loop snapshot `currentNumTokensPerBeam[beam]` rather than
+            // `llmReq->getNumTokens(beam)` so that this computation is robust
+            // under beam search: after beam reordering at a previous step,
+            // `sequenceLengths[beam]` may correspond to a (shorter) beam other
+            // than the one tracked on the CPU, and taking the difference
+            // against the live CPU state can yield a negative value.
+            auto const numNewOutputTokens = std::max<SizeType32>(0, seqLen - currentNumTokensPerBeam[beam]);
+            if (!isBeamSearch)
             {
                 TLLM_CHECK_WITH_INFO(numGeneratedTokens >= numNewOutputTokens,
                     "numNewOutputTokens must not be greater than numGeneratedTokens: "
@@ -2269,10 +2504,10 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                     auto const cumLogProb = cumLogProbsPtr[seqSlot * mOperatingBeamWidth + beam];
                     llmReq->setCumLogProb(cumLogProb, beam);
 
-                    auto const beginLogProbsOffset = reqBeamWidth == 1 ? llmReq->mPromptLen : 0;
+                    auto const beginLogProbsOffset = isBeamSearch ? 0 : llmReq->mPromptLen;
                     SizeType32 offset
                         = (seqSlot * mOperatingBeamWidth + beam) * getMaxSequenceLen() + beginLogProbsOffset;
-                    auto const generatedLength = seqLen - llmReq->mPromptLen;
+                    auto const generatedLength = std::max<SizeType32>(0, seqLen - llmReq->mPromptLen);
                     std::vector<float> logProbs(logProbsPtr + offset, logProbsPtr + offset + generatedLength);
                     llmReq->setLogProbs(logProbs, beam);
                 }
@@ -2287,7 +2522,14 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         }
 
         // Set number of tokens predicted per runtime iteration. Will be > 1 for speculative decoding.
-        llmReq->updateNumTokensPerIteration(llmReq->getMaxBeamNumTokens() - currentNumOfTokens, mModelConfig);
+        if (isBeamSearch)
+        {
+            llmReq->updateNumTokensPerIteration(numGeneratedTokens, mModelConfig);
+        }
+        else
+        {
+            llmReq->updateNumTokensPerIteration(llmReq->getMaxBeamNumTokens() - currentNumOfTokens, mModelConfig);
+        }
 
         // Fill new draft tokens for the next step
         if (decoderFinishedSumPtr[seqSlot] != reqBeamWidth
@@ -2341,9 +2583,85 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             }
         }
 
-        // Terminate if request has finished or if it is speculative decoding target model
-        if (decoderFinishedSumPtr[seqSlot] == reqBeamWidth
-            || (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens()))
+        auto const maxNumGenerated = llmReq->getMaxNumGeneratedTokens();
+        auto const decodingIter = llmReq->getDecodingIter();
+
+        // Hard cutoff (beam-search root fix): guarantee termination by the
+        // iteration budget, even when the GPU-side `finishedSum == beamWidth`
+        // mechanism fails to converge under beam search. Two independent,
+        // cheap conditions - either alone is sufficient:
+        //   cutoffByIter:   `decodingIter` is a pure counter incremented at
+        //                   the end of every updateRequests() call and is
+        //                   immune to beam reordering. We compare
+        //                   `decodingIter + 1` because the unconditional
+        //                   advanceDecodingIter() below has not yet run.
+        //                   This is the PRIMARY fix for the beam-reorder
+        //                   corner case where mTokens does not grow on a
+        //                   given step (numNewOutputTokens == 0) and
+        //                   `getMaxNumGeneratedTokens()` stalls.
+        //   cutoffByLength: redundant under sampling but required under
+        //                   speculative decoding, where a single decoder
+        //                   iteration can accept N draft tokens and the
+        //                   length may outrun iter.
+        //
+        // The cutoff terminates the entire request (all beams together):
+        // TRT-LLM beam search binds all beams of a request to a shared KV
+        // cache and cannot free a single beam independently.
+        bool const cutoffByIter = (decodingIter + 1 >= llmReq->mMaxNewTokens);
+        bool const cutoffByLength = (maxNumGenerated >= llmReq->mMaxNewTokens);
+        bool const hardMaxTokensCutoff = cutoffByIter || cutoffByLength;
+
+        if (hardMaxTokensCutoff && decoderFinishedSumPtr[seqSlot] != reqBeamWidth
+            && !llmReq->isGenerationCompleteState())
+        {
+            TLLM_LOG_DEBUG(
+                "[decoderSync] request %lu: FORCE TERMINATING "
+                "(iter=%d/%d, maxGen=%d/%d, finishedSum=%d/%d, byIter=%d, byLen=%d)",
+                llmReq->mRequestId, decodingIter, llmReq->mMaxNewTokens, maxNumGenerated, llmReq->mMaxNewTokens,
+                decoderFinishedSumPtr[seqSlot], reqBeamWidth, cutoffByIter ? 1 : 0, cutoffByLength ? 1 : 0);
+
+            // Force every beam whose finish reason is still kNOT_FINISHED to
+            // kLENGTH, so that downstream layers never observe a
+            // NOT_FINISHED reason on a terminated request. Beams that have
+            // already finished with kEND / kSTOP_WORDS keep their reason.
+            // We re-derive the reason from `finishReasonsHostData` - the same
+            // source that fed `setFinishedReason` at the top of this loop -
+            // so the override is semantically exact and future-proof against
+            // the kernel adding new FinishedState flags.
+            auto const* const beamFinishPtr = finishReasonsHostData + seqSlot * mOperatingBeamWidth;
+            for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
+            {
+                if (beamFinishPtr[beam].toFinishReason() == executor::FinishReason::kNOT_FINISHED)
+                {
+                    llmReq->setFinishedReason(executor::FinishReason::kLENGTH, beam);
+                }
+            }
+        }
+
+        // Terminate if the request has finished, hit the hard cutoff, or is a
+        // speculative-decoding target model.
+        bool const isSpeculativeTargetModel
+            = (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens());
+
+        // Per-step full beam finalize / gatherTree is expensive (finalize +
+        // gatherTree + D2H copy + host sync). Keep the per-step gather path
+        // as narrow as the original upstream code: streaming is the only
+        // scenario that genuinely requires gathered CPU state on every step
+        // (clients observe intermediate beams). Any broader gate - for
+        // example `decoderFinishedSumPtr != 0` - is effectively always-on
+        // under typical beam workloads, because once any beam has ever
+        // finished `finishedSum` stays non-zero for the rest of the
+        // request's lifetime due to beam reordering, which collapses QPS at
+        // large beam_width. The correctness fixes in this file do NOT need
+        // per-step gather: the hard cutoff above operates on `decodingIter`
+        // and re-derives the FinishReason from `finishReasonsHostData`, and
+        // `postProcessRequest` clamps any pathological gathered
+        // sequenceLengths at the final gather site.
+        bool const needsGatheredBeamState = isBeamSearch && llmReq->isStreaming();
+        bool const shouldFinalizeRequest
+            = decoderFinishedSumPtr[seqSlot] == reqBeamWidth || hardMaxTokensCutoff || isSpeculativeTargetModel;
+
+        if (shouldFinalizeRequest)
         {
             postProcessRequest(*llmReq, numDroppedTokens);
 
@@ -2366,9 +2684,11 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         }
         else
         {
-            // gather tokens in the case of streaming and beam search
-            if (llmReq->isStreaming() && llmReq->mSamplingConfig.beamWidth > 1)
+            if (needsGatheredBeamState)
             {
+                // Streaming beam search only: refresh CPU state from gathered
+                // beams so the intermediate response observed by the client
+                // matches the finalized beam ordering.
                 postProcessRequest(*llmReq, numDroppedTokens);
             }
             if (llmReq->isContextInitState())
@@ -2395,7 +2715,13 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         {
             for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
             {
-                llmReq->setNumPreDecodedTokens(numNewTokens[beam], beam);
+                auto preDecodedTokens = numNewTokens[beam];
+                if (needsGatheredBeamState || shouldFinalizeRequest)
+                {
+                    auto const gatheredNumTokens = llmReq->getNumTokens(beam);
+                    preDecodedTokens = std::max<SizeType32>(0, gatheredNumTokens - currentNumTokensPerBeam[beam]);
+                }
+                llmReq->setNumPreDecodedTokens(preDecodedTokens, beam);
             }
         }
     }

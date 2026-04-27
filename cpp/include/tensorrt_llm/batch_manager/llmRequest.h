@@ -757,6 +757,10 @@ public:
             auto& beamTokens = mTokens[beamId];
             beamTokens.resize(mPromptLen);
             beamTokens.insert(beamTokens.end(), generatedBeamTokens[beamId].begin(), generatedBeamTokens[beamId].end());
+            if (!beamTokens.empty())
+            {
+                mLastTokens[beamId] = beamTokens.back();
+            }
             auto& beamUniqueTokens = mUniqueTokens[beamId];
             beamUniqueTokens.resize(mPromptLen);
             for (auto const token : generatedBeamTokens[beamId])

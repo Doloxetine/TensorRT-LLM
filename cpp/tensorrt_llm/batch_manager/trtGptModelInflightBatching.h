@@ -340,8 +340,11 @@ private:
 
     /// @brief It gathers the logits if they need to be returned, calls getDecoderSlotHostOutputs,
     /// and overwrites the llmRequest tokens buffer.
-    /// Called either on request finishing, or at every step when doing beam search and streaming.
+    /// Called either on request finishing, or at every step when beam search needs refreshed gathered CPU state.
     void postProcessRequest(LlmRequest& llmReq, std::vector<SizeType32> const& numDroppedTokens);
+    void reorderGenerationLogitsForBeamSearch(LlmRequest& llmReq, SizeType32 seqSlot, SizeType32 reqBeamWidth,
+        SizeType32 maxSeqLength, runtime::TokenIdType const* outputIdsHostData,
+        runtime::SizeType32 const* sequenceLengthsHostData);
     /// @brief Calls gatherTree (via finalize) and transmits the received data across ranks if PP>1
     void getDecoderSlotHostOutputs(
         SizeType32 seqSlot, bool returnLogProbs, runtime::SamplingConfig const& samplingConfig, bool streaming);
