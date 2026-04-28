@@ -19,6 +19,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     WeightBiasInfoCache,
+    extract_op_args,
     extract_weight_nodes,
     get_quantization_params_from_linear_node,
     is_bmm_op,
@@ -39,7 +40,7 @@ from ...utils.quantization_utils import (
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 try:
-    from .....quantization.utils.fp4_utils import float4_sf_dtype
+    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
 
@@ -212,8 +213,20 @@ class Quantization(BaseTransform):
 
         custom_args = self.build_custom_args_for_linear(scales)
 
+        # Extract sharding hints by name so we don't depend on positional layout.
+        [tp_mode, output_sizes, tp_min_local_shape, layer_type] = extract_op_args(
+            node, "tp_mode", "output_sizes", "tp_min_local_shape", "layer_type"
+        )
+        [inp, weight, bias] = extract_op_args(node, "input", "weight", "bias")
         node.target = self.target_op()
-        node.args = (*node.args, *custom_args)
+        node.args = (inp, weight, bias, *custom_args)
+        node.kwargs = {
+            **node.kwargs,
+            "tp_mode": tp_mode,
+            "output_sizes": output_sizes,
+            "tp_min_local_shape": tp_min_local_shape,
+            "layer_type": layer_type,
+        }
 
     def _insert_quantized_bmm(
         self,
@@ -320,12 +333,22 @@ class FP8LinearQuantizationFromConfig(Quantization):
         return ([scales["input_scale"]], [scales["weight_scale"]], [], [])
 
     def load_hook(self, state_dict, prefix, *args, weight_name):
-        if weight_name in state_dict:
-            weight = state_dict[weight_name]
+        prefix = prefix or ""
+        weight_key = prefix + weight_name
+        if weight_key in state_dict:
+            weight = state_dict[weight_key]
             if weight.dtype != torch.float8_e4m3fn:
-                scale = fp8_scale(state_dict[weight_name])
-                state_dict[weight_name] = (state_dict[weight_name] / scale).to(torch.float8_e4m3fn)
-                state_dict[weight_name + "_scale"] = scale
+                scale = fp8_scale(state_dict[weight_key])
+                state_dict[weight_key] = (state_dict[weight_key] / scale).to(torch.float8_e4m3fn)
+                state_dict[weight_key + "_scale"] = scale
+            else:
+                mod_prefix = prefix + weight_name.rsplit(".", 1)[0]
+                activation_scale_name = mod_prefix + ".activation_scale"
+                weight_scale_inv_name = weight_key + "_scale_inv"
+                if activation_scale_name in state_dict:
+                    state_dict[mod_prefix + ".input_scale"] = state_dict.pop(activation_scale_name)
+                if weight_scale_inv_name in state_dict:
+                    state_dict[mod_prefix + ".weight_scale"] = state_dict.pop(weight_scale_inv_name)
 
     def convert_amax_hook(self, state_dict, prefix, *args, scale_name: str, amax_name: str):
         """Convert amax from modelopt quantized graph to scales."""
@@ -395,6 +418,10 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         return ([scales["input_scale"]], [scales["weight_scale"], scales["alpha"]], [], [])
 
     def load_hook(self, state_dict, prefix, *args, weight_name):
+        # Prepend prefix so the hook works when the GraphModule is a submodule
+        # of the model on which load_state_dict is called (e.g., VLM models
+        # where the text model lives at model.language_model.*).
+        weight_name = prefix + weight_name
         if weight_name in state_dict:
             input_scale_name = weight_name.rsplit(".", 1)[0] + ".input_scale"
             alpha_name = weight_name.rsplit(".", 1)[0] + ".alpha"
@@ -880,6 +907,10 @@ class FineGrainedFP8LinearQuantization(Quantization):
 
         quant_method = str(qcfg.get("quant_method", "")).lower()
         if quant_method != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        if qcfg.get("weight_block_size") is None:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )

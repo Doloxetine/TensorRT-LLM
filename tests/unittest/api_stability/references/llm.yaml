@@ -87,6 +87,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.AttentionDpConfig]
         default: null
         status: beta
+      dwdp_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DwdpConfig]
+        default: null
+        status: prototype
       checkpoint_loader:
         annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
@@ -96,6 +100,10 @@ methods:
         default: null
         status: prototype
       mm_encoder_only:
+        annotation: bool
+        default: False
+        status: prototype
+      encode_only:
         annotation: bool
         default: False
         status: prototype
@@ -122,7 +130,7 @@ methods:
       sampler_type:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
-        status: beta
+        status: deprecated
       sampler_force_async_worker:
         annotation: bool
         default: False
@@ -154,6 +162,10 @@ methods:
       perf_metrics_max_requests:
         annotation: int
         default: 0
+        status: prototype
+      prometheus_metrics_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig]
+        default: null
         status: prototype
       enable_energy_metrics:
         annotation: bool
@@ -227,6 +239,10 @@ methods:
         annotation: Optional[Dict[str, str]]
         default: null
         status: prototype
+      telemetry_config:
+        annotation: tensorrt_llm.usage.config.TelemetryConfig
+        default: null
+        status: prototype
       max_stats_len:
         annotation: int
         default: 1000
@@ -295,6 +311,20 @@ methods:
         default: 0.5
         status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
+  encode:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
+          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]]]
+        default: inspect._empty
+      add_special_tokens:
+        annotation: bool
+        default: True
+      model_kwargs:
+        annotation: Any
+        default: inspect._empty
+    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]
+    status: prototype
   preprocess:
     parameters:
       inputs:

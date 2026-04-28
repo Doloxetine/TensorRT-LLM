@@ -168,10 +168,20 @@ class GrpcRequestManager:
             if self.llm is None:
                 return False, "LLM not initialized"
 
-            # Check if executor is available and not shutdown
+            # Check executor health (includes error queue, MPI worker
+            # liveness, and fatal error state — not just doing_shutdown).
             if hasattr(self.llm, "_executor"):
-                if self.llm._executor is None or self.llm._executor.is_shutdown():
-                    return False, "Executor is shutdown"
+                if self.llm._executor is None:
+                    return False, "Executor is not available"
+                if not self.llm._executor.check_health():
+                    error_msg = "Executor is unhealthy"
+                    if self.llm._executor._fatal_error is not None:
+                        exc = self.llm._executor._fatal_error
+                        lines = str(exc).splitlines()
+                        short = (lines[0] if lines else type(exc).__name__)[:200]
+                        error_msg = f"{type(exc).__name__}: {short}"
+                        logger.error(f"Health check fatal error: {repr(exc)}")
+                    return False, error_msg
 
             return True, "OK"
         except Exception as e:
@@ -246,6 +256,7 @@ def create_sampling_params_from_proto(
     bad_token_ids: Optional[List[int]] = None,
     guided_decoding: Optional[pb2.GuidedDecodingParams] = None,
     embedding_bias: Optional[List[float]] = None,
+    include_stop_token_in_output: bool = False,
 ) -> SamplingParams:
     """Convert protobuf configuration to TensorRT-LLM SamplingParams.
 
@@ -332,6 +343,8 @@ def create_sampling_params_from_proto(
         kwargs["stop_token_ids"] = stop_token_ids
     if ignore_eos:
         kwargs["ignore_eos"] = True
+    if include_stop_token_in_output:
+        kwargs["include_stop_str_in_output"] = True
 
     # Bad words (TRT-LLM's _setup() tokenizes bad word strings)
     if bad:

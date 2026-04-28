@@ -19,7 +19,6 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import get_draft_token_length
-from .mamba_cache_manager import MambaCacheManager, use_cpp_mamba_cache_manager
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -116,6 +115,11 @@ class CUDAGraphRunner:
         if self.enabled:
             self._create_shared_static_tensors()
         self.cuda_graph_meta_buffers = get_memory_buffers()
+
+        # On-the-fly capture is disabled by default to prevent workspace
+        # tensor reallocation from invalidating addresses baked into existing
+        # CUDA graphs.  Use allow_capture() context manager during warmup.
+        self._capture_allowed = False
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -270,6 +274,11 @@ class CUDAGraphRunner:
             return self.graph_metadata[key][
                 "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
 
+        # Graph doesn't exist yet.  If on-the-fly capture is not allowed,
+        # fall back to eager so the caller doesn't need a separate check.
+        if not self._capture_allowed:
+            return None, None, None
+
         if batch_size not in self.supported_batch_sizes:
             return None, None, None
 
@@ -287,7 +296,22 @@ class CUDAGraphRunner:
         return graph_attn_metadata, graph_spec_metadata, key
 
     def needs_capture(self, key: KeyType):
-        return key not in self.graph_outputs
+        return self._capture_allowed and key not in self.graph_outputs
+
+    @contextlib.contextmanager
+    def allow_capture(self):
+        """Context manager that enables CUDA graph capture.
+
+        Capture is disabled by default.  On-the-fly captures outside this
+        context are prevented because they can resize the shared
+        cuda_graph_workspace tensor, invalidating addresses baked into
+        previously captured graphs.
+        """
+        self._capture_allowed = True
+        try:
+            yield
+        finally:
+            self._capture_allowed = False
 
     def get_graph_pool(self):
         """Returns the CUDA memory pool used by this graph runner.
@@ -477,11 +501,6 @@ class CUDAGraphRunner:
             if spec_res_mgr:
                 spec_res_mgr.add_dummy_requests([dummy_request_id])
             self.padding_dummy_requests[runtime_draft_len] = dummy_request
-
-        if (isinstance(kv_cache_manager, MambaCacheManager)
-                and not use_cpp_mamba_cache_manager()):
-            kv_cache_manager.reorder_state_indices_when_padding_requests(
-                batch_size, padding_size)
 
         padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
         batch.generation_requests.extend([padding_dummy_request] * padding_size)

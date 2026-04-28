@@ -20,25 +20,19 @@ Uses diffusion-specific wrappers (TrtllmAttention, VanillaAttention)
 that handle metadata preparation internally for simplified usage.
 """
 
-from typing import TYPE_CHECKING, Optional, Type, Union
+from typing import Optional, Type
 
 import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-# Lazy imports to avoid circular dependency
-if TYPE_CHECKING:
-    from .flash_attn4 import FlashAttn4Attention
-    from .trtllm import TrtllmAttention
-    from .vanilla import VanillaAttention
-
-    # Type alias for diffusion attention backends
-    DiffusionAttentionBackend = Union[TrtllmAttention, VanillaAttention, FlashAttn4Attention]
+from ..config import AttentionConfig
+from .interface import AttentionBackend
 
 
 def get_visual_gen_attention_backend(
     backend_name: str,
-) -> Type["DiffusionAttentionBackend"]:
+) -> Type[AttentionBackend]:
     """
     Get diffusion attention backend class by name.
 
@@ -84,8 +78,10 @@ def create_attention(
     dtype: Optional[torch.dtype] = None,
     max_batch_size: int = 16,
     max_seq_len: int = 4096,
+    attention_config: Optional[AttentionConfig] = None,
+    attention_metadata_state: Optional[dict] = None,
     **kwargs,
-) -> "DiffusionAttentionBackend":
+) -> AttentionBackend:
     """
     Factory function to create attention backend instance for visual generation.
 
@@ -93,7 +89,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
@@ -104,12 +100,23 @@ def create_attention(
             will automatically reallocate if larger batches are encountered.
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
+        attention_config: Optional AttentionConfig
+        attention_metadata_state: Optional model-scoped metadata state from
+            visual-gen config. Required for TRTLLM backend.
         **kwargs: Additional backend-specific arguments
 
     Returns:
-        Diffusion attention backend instance (TrtllmAttention or VanillaAttention)
+        AttentionBackend instance
     """
     attn_cls = get_visual_gen_attention_backend(backend)
+
+    if backend.upper() == "TRTLLM":
+        if attention_metadata_state is None:
+            raise ValueError(
+                "TRTLLM backend requires `attention_metadata_state` from "
+                "DiffusionModelConfig; creation path must not allocate metadata implicitly."
+            )
+        kwargs["attention_metadata_state"] = attention_metadata_state
 
     return attn_cls(
         layer_idx=layer_idx,

@@ -37,6 +37,15 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 
+@dataclass
+class MockPrefixReuseSummary:
+    """Mock for C++ PrefixReuseSummary returned by analyze_prefix_reuse."""
+
+    reusable_blocks_allocated: int = 0
+    reusable_blocks_all: int = 0
+    first_new_block: Optional[object] = None
+
+
 def _make_request(
     request_id: int,
     prompt_len: int = 10,
@@ -165,8 +174,17 @@ class MockKVCacheManager:
     def scheduling_remove_sequence(self, req_id: int):
         pass
 
-    def find_new_context_block(self, unique_tokens, req):
-        return None
+    def analyze_prefix_reuse(self, unique_tokens, req):
+        if self.enable_block_reuse and unique_tokens:
+            # Derive a deterministic, hashable block key from the tokens so that
+            # duplicate requests produce equal first_new_block values and trigger
+            # the beneficial-to-skip logic.  UniqueToken objects (nanobind-wrapped
+            # C++ structs) have no __hash__/__eq__, so extract the primitive fields.
+            block_key = tuple(
+                t if isinstance(t, int) else (t.token_id, t.token_extra_id) for t in unique_tokens
+            )
+            return MockPrefixReuseSummary(first_new_block=block_key)
+        return MockPrefixReuseSummary()
 
     def get_max_resource_count(self) -> int:
         return self._num_free_blocks
@@ -1019,46 +1037,42 @@ class TestPyMicroBatchSchedulerReusableTokens:
         C++ ref: ReusableTokensWithChunkedContextEqualProgress
 
         Note: In PyMicroBatchScheduler, max_context_length = max_num_tokens, so
-        individual chunk sizes are capped at max_num_tokens. Parameters are chosen
-        so the reusable prefix is smaller than max_num_tokens, allowing the
-        compute-aware path to produce noticeably larger chunks than the raw path.
+        individual chunk sizes are capped at max_num_tokens.
 
-        Setup: 3 requests, prompt_len=15, reusable=5, compute budget=8, chunk_unit=1.
-        max_context_length = max_num_tokens = 8 (caps individual chunk sizes at 8).
-        Total compute if all scheduled in full: 3 * (15 - 5) = 30 > 8 → chunking exercised.
+        setPrepopulatedPromptLen shifts the chunk window right by the reused amount.
+        For non-last chunks (reusable + chunkSize < contextRemaining), cost = chunkSize.
+        For last chunks (reusable + chunkSize >= contextRemaining),
+        cost = contextRemaining - reusable.
 
-        Reusable tokens 0-4 are "free" (compute_increment = 0 until chunk > 5).
-        Budget is only consumed for tokens beyond the reusable prefix.
+        Setup: 2 requests, prompt_len=15, max_num_tokens=15, chunk_unit=1.
+          req0: reusable=10 → last-chunk threshold at chunk=5 (10+5=15).
+          req1: reusable=0  → all tokens cost budget.
+          Tentative compute: 5 + 15 = 20 > 15 → chunking exercised.
 
-        This test validates the loop-termination fix: num_tokens_single_loop must use
-        the raw chunk increment (not compute_increment). With the bug, the loop exits
-        on the very first iteration because compute_increment=0 for all reqs → loops
-        terminates at chunk=1. With the fix, the loop continues until the compute
-        budget is exhausted or max_context_length is reached.
+        EQUAL_PROGRESS trace:
+          iter 1-4: both non-last, cost=chunkSize each. total=8.
+          iter 5: req0 crosses threshold (last-chunk, cost=5, increment=1).
+                  req1 still non-last (cost=5, increment=1). total=10.
+          iter 6-10: req0 increment=0 (free growth), req1 increment=1. total=15.
+          Result: req0=10, req1=10, total compute=15=budget.
 
-        Expected (compute-aware EQUAL_PROGRESS):
-          req0: chunk=8  (model cost = 8 - 5 = 3)
-          req1: chunk=8  (model cost = 3)
-          req2: chunk=7  (model cost = 7 - 5 = 2; total compute 3+3+2=8 = budget)
+        Without reusable tokens, budget=15 yields req0=8, req1=7.
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=1)
         scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=8, ctx_chunk_config=config
+            max_batch_size=4, max_num_tokens=15, ctx_chunk_config=config
         )
         req0 = make_context_request(0, prompt_len=15)
         req1 = make_context_request(1, prompt_len=15)
-        req2 = make_context_request(2, prompt_len=15)
-        req0.estimated_reusable_tokens = 5
-        req1.estimated_reusable_tokens = 5
-        req2.estimated_reusable_tokens = 5
+        req0.estimated_reusable_tokens = 10
+        req1.estimated_reusable_tokens = 0
 
-        ctx, gen = scheduler.schedule([req0, req1, req2], set())
+        ctx, gen = scheduler.schedule([req0, req1], set())
 
         chunks = {r.request_id: r.context_chunk_size for r in ctx}
-        assert len(ctx) == 3, "All three requests should be scheduled"
-        assert chunks[0] == 8, "req0: reusable(5) + 3 compute tokens = 8"
-        assert chunks[1] == 8, "req1: reusable(5) + 3 compute tokens = 8"
-        assert chunks[2] == 7, "req2: reusable(5) + 2 compute tokens = 7"
+        assert len(ctx) == 2, "Both requests should be scheduled"
+        assert chunks[0] == 10, "req0: free growth past threshold, capped by budget"
+        assert chunks[1] == 10, "req1: benefits from req0's free growth"
 
 
 # ############################################################################
@@ -1379,6 +1393,276 @@ class TestContextChunkingDirect:
             ep_draft_lengths=[3],
             fcfs_draft_lengths=[3],
         )
+
+
+class TestForceChunkPolicy:
+    """
+    Tests for FORCE_CHUNK chunking policy in PyMicroBatchScheduler.
+    FORCE_CHUNK always chunks every context request to at most chunk_unit_size
+    tokens per scheduling step, regardless of whether the full context would fit
+    in the budget.
+
+    Aligned with C++ ForceChunkTest in microBatchSchedulerTest.cpp.
+    """
+
+    # --- Helper methods (mirrors C++ ForceChunkTest fixture) ---
+
+    @staticmethod
+    def _chunk_iteration(requests, chunk_unit_size, capacity=None):
+        """Run a single chunking iteration: call _set_ctx_requests_chunk_size
+        with FORCE_CHUNK, then move_to_next_context_chunk for active requests.
+        C++ ref: ForceChunkTest::chunkIteration"""
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=chunk_unit_size)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64, max_num_tokens=1000, ctx_chunk_config=config
+        )
+        active = [r for r in requests if r.context_remaining_length > 0]
+        scheduler._set_ctx_requests_chunk_size(active, capacity)
+        for r in active:
+            r.move_to_next_context_chunk()
+
+    @staticmethod
+    def _expect_positions(requests, expected, label=""):
+        """Verify context positions of all requests match expected values.
+        C++ ref: ForceChunkTest::expectPositions"""
+        assert len(requests) == len(expected), label
+        for i, req in enumerate(requests):
+            assert req.context_current_position == expected[i], (
+                f"{label} request {i} (id={req.request_id}): "
+                f"expected {expected[i]}, got {req.context_current_position}"
+            )
+
+    # --- Direct _set_ctx_requests_chunk_size tests ---
+    # C++ ref: ForceChunkTest::Basic through CapacityAcrossIterations
+
+    def test_basic(self):
+        """
+        A single request with prompt_len > chunk_unit_size is chunked to unit_size.
+        C++ ref: ForceChunkTest.Basic
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64, max_num_tokens=1000, ctx_chunk_config=config
+        )
+        reqs = [make_context_request(0, prompt_len=30)]
+        scheduler._set_ctx_requests_chunk_size(reqs, None)
+        assert reqs[0].context_chunk_size == 10
+
+    def test_prompt_smaller_than_unit(self):
+        """
+        When prompt_len < chunk_unit_size, chunk_size = prompt_len (min).
+        C++ ref: ForceChunkTest.PromptSmallerThanUnit
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=20)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64, max_num_tokens=1000, ctx_chunk_config=config
+        )
+        reqs = [make_context_request(0, prompt_len=8)]
+        scheduler._set_ctx_requests_chunk_size(reqs, None)
+        assert reqs[0].context_chunk_size == 8
+
+    def test_exact_unit_size(self):
+        """
+        When prompt_len == chunk_unit_size, chunk_size = prompt_len.
+        C++ ref: ForceChunkTest.ExactUnitSize
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64, max_num_tokens=1000, ctx_chunk_config=config
+        )
+        reqs = [make_context_request(0, prompt_len=10)]
+        scheduler._set_ctx_requests_chunk_size(reqs, None)
+        assert reqs[0].context_chunk_size == 10
+
+    def test_multiple_requests(self):
+        """
+        Each request independently gets min(remaining, unit_size).
+        C++ ref: ForceChunkTest.MultipleRequests
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64, max_num_tokens=1000, ctx_chunk_config=config
+        )
+        reqs = [
+            make_context_request(0, prompt_len=25),
+            make_context_request(1, prompt_len=15),
+            make_context_request(2, prompt_len=5),
+        ]
+        scheduler._set_ctx_requests_chunk_size(reqs, None)
+        assert reqs[0].context_chunk_size == 10
+        assert reqs[1].context_chunk_size == 10
+        assert reqs[2].context_chunk_size == 5  # min(5, 10)
+
+    def test_capacity_limits(self):
+        """
+        When capacity is limited, later requests get chunk_size=0.
+        C++ ref: ForceChunkTest.CapacityLimits
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64, max_num_tokens=1000, ctx_chunk_config=config
+        )
+        reqs = [
+            make_context_request(0, prompt_len=30),
+            make_context_request(1, prompt_len=30),
+        ]
+        scheduler._set_ctx_requests_chunk_size(reqs, capacity=15)
+        # req0 gets 10, req1 would push total to 20 > 15 → 0
+        assert reqs[0].context_chunk_size == 10
+        assert reqs[1].context_chunk_size == 0
+
+    def test_capacity_exact_fit(self):
+        """
+        When capacity exactly accommodates all chunks.
+        C++ ref: ForceChunkTest.CapacityExactFit
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64, max_num_tokens=1000, ctx_chunk_config=config
+        )
+        reqs = [
+            make_context_request(0, prompt_len=30),
+            make_context_request(1, prompt_len=30),
+        ]
+        scheduler._set_ctx_requests_chunk_size(reqs, capacity=20)
+        assert reqs[0].context_chunk_size == 10
+        assert reqs[1].context_chunk_size == 10
+
+    def test_multi_iteration(self):
+        """
+        A request with prompt_len=25 and chunk_unit_size=10 processes in 3
+        iterations: chunk 1: 10, chunk 2: 10, chunk 3: 5.
+        C++ ref: ForceChunkTest.MultiIteration
+        """
+        reqs = [make_context_request(0, prompt_len=25)]
+
+        # Iteration 1
+        self._chunk_iteration(reqs, 10)
+        self._expect_positions(reqs, [10], "iter 1")
+
+        # Iteration 2
+        self._chunk_iteration(reqs, 10)
+        self._expect_positions(reqs, [20], "iter 2")
+
+        # Iteration 3
+        self._chunk_iteration(reqs, 10)
+        self._expect_positions(reqs, [25], "iter 3")
+
+    def test_multi_request_multi_iteration(self):
+        """
+        Two requests with different lengths processed over multiple iterations.
+        prompt_len={25, 12}, chunk_unit_size=10.
+        C++ ref: ForceChunkTest.MultiRequestMultiIteration
+        """
+        reqs = [
+            make_context_request(0, prompt_len=25),
+            make_context_request(1, prompt_len=12),
+        ]
+
+        # Iteration 1: both get 10
+        self._chunk_iteration(reqs, 10)
+        self._expect_positions(reqs, [10, 10], "iter 1")
+
+        # Iteration 2: req0 gets 10, req1 gets 2 (remaining)
+        self._chunk_iteration(reqs, 10)
+        self._expect_positions(reqs, [20, 12], "iter 2")
+
+        # Iteration 3: only req0 active (remaining=5), req1 done
+        self._chunk_iteration(reqs, 10)
+        self._expect_positions(reqs, [25, 12], "iter 3")
+
+    def test_capacity_across_iterations(self):
+        """
+        With limited capacity, some requests may be delayed to later iterations.
+        prompt_len={25, 25}, chunk_unit_size=10, capacity=15.
+        C++ ref: ForceChunkTest.CapacityAcrossIterations
+        """
+        reqs = [
+            make_context_request(0, prompt_len=25),
+            make_context_request(1, prompt_len=25),
+        ]
+
+        # Iteration 1: req0=10, req1=0 (10+10=20 > 15)
+        self._chunk_iteration(reqs, 10, capacity=15)
+        self._expect_positions(reqs, [10, 0], "iter 1")
+
+        # Iteration 2: req0=10, req1=0 (still constrained)
+        self._chunk_iteration(reqs, 10, capacity=15)
+        self._expect_positions(reqs, [20, 0], "iter 2")
+
+        # Iteration 3: req0=5, req1=10 (5+10=15 == capacity)
+        self._chunk_iteration(reqs, 10, capacity=15)
+        self._expect_positions(reqs, [25, 10], "iter 3")
+
+        # Iteration 4: only req1 active (remaining=15), gets 10
+        self._chunk_iteration(reqs, 10, capacity=15)
+        self._expect_positions(reqs, [25, 20], "iter 4")
+
+        # Iteration 5: req1 remaining=5
+        self._chunk_iteration(reqs, 10, capacity=15)
+        self._expect_positions(reqs, [25, 25], "iter 5")
+
+    # --- Full scheduler.schedule() tests ---
+    # C++ ref: ForceChunkTest::FullSchedulerPath through FullSchedulerWithGeneration
+
+    def test_full_scheduler_path(self):
+        """
+        FORCE_CHUNK always re-chunks even when all contexts fit within the
+        token budget. Test via the full schedule() path.
+        C++ ref: ForceChunkTest.FullSchedulerPath
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=4, max_num_tokens=100, ctx_chunk_config=config
+        )
+        req = make_context_request(0, prompt_len=30)
+        ctx, gen = scheduler.schedule([req], set())
+        # Despite budget=100 >> prompt=30, FORCE_CHUNK limits chunk to unit_size=10.
+        assert len(ctx) == 1
+        assert ctx[0].context_chunk_size == 10
+        assert len(gen) == 0
+
+    def test_full_scheduler_multiple_requests(self):
+        """
+        Full scheduler path with multiple requests.
+        C++ ref: ForceChunkTest.FullSchedulerMultipleRequests
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=4, max_num_tokens=100, ctx_chunk_config=config
+        )
+        requests = [
+            make_context_request(0, prompt_len=25),
+            make_context_request(1, prompt_len=15),
+            make_context_request(2, prompt_len=5),
+        ]
+        ctx, gen = scheduler.schedule(requests, set())
+        assert len(ctx) == 3
+        # Find by request_id since sorting may reorder.
+        chunks = {r.request_id: r.context_chunk_size for r in ctx}
+        assert chunks[0] == 10
+        assert chunks[1] == 10
+        assert chunks[2] == 5
+
+    def test_full_scheduler_with_generation(self):
+        """
+        Context chunking with concurrent generation requests.
+        Generation tokens reduce the available budget for context chunks.
+        C++ ref: ForceChunkTest.FullSchedulerWithGeneration
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=4, max_num_tokens=15, ctx_chunk_config=config
+        )
+        requests = [
+            make_generation_request(0),  # costs 1 token
+            make_context_request(1, prompt_len=30),
+        ]
+        ctx, gen = scheduler.schedule(requests, set())
+        assert len(gen) == 1
+        assert len(ctx) == 1
+        # Budget remaining = 15 - 1 (gen) = 14; chunk = min(30, 10) = 10
+        assert ctx[0].context_chunk_size == 10
 
 
 class TestDraftTokensGreaterThanChunkSize:
@@ -2180,8 +2464,11 @@ class TestPyCapacitySchedulerKVCacheReuse:
         r1 = _make_request(1, prompt_len=21, input_tokens=tokens)
         r2 = _make_request(2, prompt_len=21, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2])
-        # With reuse enabled, beneficial_to_skip may delay r1 and r2
-        assert len(fitting) >= 1
+        # With reuse enabled, r1 and r2 share the same prefix as r0 and are delayed.
+        # GUARANTEED_NO_EVICT skips them via continue — they are not in paused.
+        assert len(fitting) == 1
+        assert fitting[0].request_id == 0
+        assert len(paused) == 0
 
     def test_delay_duplicate_request_chunked(self):
         """C++ ref: DelayDuplicateRequestChunked"""
@@ -2197,7 +2484,11 @@ class TestPyCapacitySchedulerKVCacheReuse:
         r1 = _make_request(1, prompt_len=50, input_tokens=tokens)
         r1.context_chunk_size = 20
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
-        assert len(fitting) >= 1
+        # r1 shares the same prefix as r0 and is delayed.
+        # GUARANTEED_NO_EVICT skips it via continue — it is not in paused.
+        assert len(fitting) == 1
+        assert fitting[0].request_id == 0
+        assert len(paused) == 0
 
     def test_delay_five_requests_complicated(self):
         """C++ ref: DelayFiveRequestsComplicated"""
@@ -2227,7 +2518,11 @@ class TestPyCapacitySchedulerKVCacheReuse:
         r0 = _make_request(0, prompt_len=20, input_tokens=tokens)
         r1 = _make_request(1, prompt_len=20, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
-        assert len(fitting) >= 1
+        # r1 shares the same prefix as r0 and is delayed.
+        # GUARANTEED_NO_EVICT skips it via continue — it is not in paused.
+        assert len(fitting) == 1
+        assert fitting[0].request_id == 0
+        assert len(paused) == 0
 
     def test_reuse_aware_partial_prefix_match(self):
         """C++ ref: ReuseAwareSchedulingWithPartialPrefixMatch"""
@@ -2242,7 +2537,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
         r0 = _make_request(0, prompt_len=30, input_tokens=tokens0)
         r1 = _make_request(1, prompt_len=30, input_tokens=tokens1)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
-        assert len(fitting) >= 1
+        # Different token sequences produce different block keys — no skipping
+        assert len(fitting) == 2
 
     def test_no_reuse_with_different_prompts(self):
         """C++ ref: NoReuseWithDifferentPrompts"""

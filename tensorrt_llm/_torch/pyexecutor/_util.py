@@ -29,13 +29,14 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
-from .config_utils import (get_qwen3_hybrid_layer_masks, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid)
+from .config_utils import (get_qwen3_hybrid_layer_masks, is_hybrid_linear,
+                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid)
+from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
-from .mamba_cache_manager import MambaHybridCacheManager
+from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
@@ -61,7 +62,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_nemotron_hybrid(config) or is_qwen3_hybrid(config):
+    elif is_hybrid_linear(config):
         return MambaHybridCacheManager
     else:
         return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
@@ -94,6 +95,7 @@ class KvCacheCreator:
         speculative_config: SpeculativeConfig,
         sparse_attention_config: SparseAttentionConfig,
         profiling_stage_data: Optional[dict],
+        is_disagg: bool,
         execution_stream: Optional[torch.cuda.Stream] = None,
         draft_config: Optional[ModelConfig] = None,
         skip_est: bool = False,
@@ -117,22 +119,28 @@ class KvCacheCreator:
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
-        self._kv_cache_manager_cls = get_kv_cache_manager_cls(
-            model_engine.model.model_config, kv_cache_config)
+        self._is_disagg = is_disagg
         self._execution_stream = execution_stream
-        if self._kv_cache_manager_cls == KVCacheManagerV2:
-            if kv_connector_manager is not None or (
-                    max_beam_width is not None and max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0:
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1 or event buffer max size > 0. "
-                    "Falling back to KVCacheManager.")
+        self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
+            model_engine)
         self._draft_config = draft_config
         self._skip_est = skip_est
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
-        return get_kv_cache_manager_cls(model_engine.model.model_config,
-                                        self._kv_cache_config)
+        cls = get_kv_cache_manager_cls(model_engine.model.model_config,
+                                       self._kv_cache_config)
+        if cls == KVCacheManagerV2:
+            if self._kv_connector_manager is not None or (
+                    self._max_beam_width is not None and self._max_beam_width
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
+                        self._cache_transceiver_config is not None
+                        and self._cache_transceiver_config.backend is not None):
+                logger.warning(
+                    "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
+                    "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
+                )
+                cls = KVCacheManager
+        return cls
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -357,8 +365,9 @@ class KvCacheCreator:
 
         free_mem, total_mem = torch.cuda.mem_get_info()
         max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
-        max_num_tokens_in_memory = max_memory // self._get_kv_size_per_token(
-        ) // self._tokens_per_block * self._tokens_per_block
+        max_num_tokens_in_memory = int(
+            max_memory // self._get_kv_size_per_token() //
+            self._tokens_per_block * self._tokens_per_block)
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
         return min(
@@ -573,6 +582,7 @@ class KvCacheCreator:
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
+            is_disagg=self._is_disagg,
         )
 
         if not self._skip_est:
@@ -715,6 +725,7 @@ class KvCacheCreator:
             is_draft=True,
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
+            is_disagg=self._is_disagg,
         )
 
     def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
@@ -774,6 +785,20 @@ class KvCacheCreator:
                 and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
             draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
 
+        # Also split for V1 VSWA. The VSWA pool is sized directly from
+        # max_gpu_total_bytes and ignores max_tokens, so without splitting
+        # both target and draft each allocate the full combined budget.
+        # V1 non-VSWA does not need this: max_tokens caps the block count
+        # per model, giving each a proportional share of the budget.
+        has_draft = (
+            self._draft_model_engine is not None  # two-model
+            or self._should_create_separate_draft_kv_cache())  # one-model
+        if (not estimating_kv_cache and has_draft
+                and draft_kv_cache_config is None
+                and not issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)
+                and is_vswa_enabled(self._kv_cache_config)):
+            draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
+
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine, estimating_kv_cache)
 
@@ -785,11 +810,18 @@ class KvCacheCreator:
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
-            assert draft_kv_cache_config is None, (
-                "KVCacheManagerV2 does not support two-model speculative decoding "
-                "with separate draft KV cache budget splitting.")
+            if issubclass(self._kv_cache_manager_cls, KVCacheManagerV2):
+                assert draft_kv_cache_config is None, (
+                    "KVCacheManagerV2 does not support two-model speculative "
+                    "decoding with separate draft KV cache budget splitting.")
+            # For V1 VSWA, apply the draft's split budget temporarily
+            if draft_kv_cache_config is not None:
+                saved_budget = self._kv_cache_config.max_gpu_total_bytes
+                self._kv_cache_config.max_gpu_total_bytes = draft_kv_cache_config.max_gpu_total_bytes
             draft_kv_cache_manager = self._create_kv_cache_manager(
                 self._draft_model_engine, estimating_kv_cache)
+            if draft_kv_cache_config is not None:
+                self._kv_cache_config.max_gpu_total_bytes = saved_budget
         # One-model speculative decoding with different KV layouts
         elif self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
@@ -857,6 +889,7 @@ def _create_kv_cache_manager(
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
+        is_disagg: bool = False,
         estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         # Optional overrides for one-model draft case (when model_engine is None)
@@ -960,7 +993,7 @@ def _create_kv_cache_manager(
             # - If layer_mask[i] is True, include layer i
             # - For layers beyond hybrid_override_pattern, treat them as attention layers
             pattern_len = len(config.hybrid_override_pattern)
-            hybrid_layer_mask = []
+            full_attention_layer_mask = []
             mamba_layer_mask = []
             for i, include in enumerate(layer_mask):
                 if i < pattern_len:
@@ -971,13 +1004,14 @@ def _create_kv_cache_manager(
                     # Beyond the pattern (e.g., MTP/draft layers), treat as attention-only
                     is_attention = True
                     is_mamba = False
-                hybrid_layer_mask.append(is_attention and include)
+                full_attention_layer_mask.append(is_attention and include)
                 mamba_layer_mask.append(is_mamba and include)
-            num_layers = sum(hybrid_layer_mask)
+            num_full_attention_layers = sum(full_attention_layer_mask)
             mamba_num_layers = sum(mamba_layer_mask)
         else:
-            num_layers = config.hybrid_override_pattern.count("*")
-            hybrid_layer_mask = [
+            num_full_attention_layers = config.hybrid_override_pattern.count(
+                "*")
+            full_attention_layer_mask = [
                 char == "*" for char in config.hybrid_override_pattern
             ]
             mamba_num_layers = config.hybrid_override_pattern.count("M")
@@ -993,9 +1027,9 @@ def _create_kv_cache_manager(
                 from ..speculative.utils import get_num_spec_layers
                 num_spec_layers = get_num_spec_layers(spec_config)
                 if num_spec_layers > 0:
-                    hybrid_layer_mask.extend([True] * num_spec_layers)
+                    full_attention_layer_mask.extend([True] * num_spec_layers)
                     mamba_layer_mask.extend([False] * num_spec_layers)
-                    num_layers += num_spec_layers
+                    num_full_attention_layers += num_spec_layers
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
@@ -1008,11 +1042,12 @@ def _create_kv_cache_manager(
             config.torch_dtype,
             quant_config.mamba_ssm_cache_dtype
             if quant_config is not None else None,
+            is_disagg,
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            layer_mask=hybrid_layer_mask,
+            num_layers=num_full_attention_layers,
+            layer_mask=full_attention_layer_mask,
             num_kv_heads=per_layer_num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -1023,6 +1058,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            model_type="nemotron_hybrid",
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
@@ -1033,9 +1069,20 @@ def _create_kv_cache_manager(
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
-        hybrid_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
+        full_attention_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
             config)
-        num_layers = sum(hybrid_layer_mask)
+        # For hybrid models, full_attention_layer_mask is always passed as
+        # layer_mask to KVCacheManager, which means get_pp_layers
+        # sees a non-None layer_mask and won't auto-add spec layers.
+        # Extend the masks here to include MTP spec layers (full
+        # attention, no linear states) so they get KV cache entries.
+        if spec_config is not None:
+            from ..speculative.utils import get_num_spec_layers
+            num_spec_layers = get_num_spec_layers(spec_config)
+            if num_spec_layers > 0:
+                full_attention_layer_mask.extend([True] * num_spec_layers)
+                mamba_layer_mask.extend([False] * num_spec_layers)
+        num_full_attention_layers = sum(full_attention_layer_mask)
         num_mamba_layers = sum(mamba_layer_mask)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
@@ -1049,11 +1096,12 @@ def _create_kv_cache_manager(
             config.torch_dtype,
             quant_config.mamba_ssm_cache_dtype
             if quant_config is not None else None,
+            is_disagg,
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            layer_mask=hybrid_layer_mask,
+            num_layers=num_full_attention_layers,
+            layer_mask=full_attention_layer_mask,
             num_kv_heads=per_layer_num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -1064,12 +1112,15 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            model_type="qwen3_next",
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
         is_vswa = is_vswa_enabled(kv_cache_config)
         binding_model_config = _model_config.get_bindings_model_config(
-            tokens_per_block=tokens_per_block) if is_vswa else None
+            tokens_per_block=tokens_per_block,
+            kv_cache_config=kv_cache_config,
+            spec_config=spec_config) if is_vswa else None
 
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
@@ -1122,6 +1173,7 @@ def create_py_executor_instance(
     cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
+    dwdp_manager: Optional[DwdpManager] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -1132,7 +1184,8 @@ def create_py_executor_instance(
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
-
+    is_disagg = (cache_transceiver_config is not None
+                 and cache_transceiver_config.backend is not None)
     for key, value in llm_args.extra_resource_managers.items():
         if key in resources:
             raise ValueError(
@@ -1141,6 +1194,8 @@ def create_py_executor_instance(
 
     peft_cache_manager = None
     if lora_config is not None:
+        # TODO: Refactor dimension resolution into a LoraModuleDimensions
+        # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
 
         if len(lora_config.lora_dir) == 1:
@@ -1154,7 +1209,7 @@ def create_py_executor_instance(
                 )
 
         model_binding_config = model_engine.model.model_config.get_bindings_model_config(
-        )
+            is_disagg=is_disagg)
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
@@ -1188,6 +1243,26 @@ def create_py_executor_instance(
         if moe_intermediate is not None and moe_intermediate > 0:
             moe_hidden_size = moe_intermediate // mapping.tp_size
 
+        # Mamba dimensions for hybrid models (e.g., Nemotron-H)
+        # d_inner = mamba_head_dim * mamba_num_heads
+        # d_in_proj = 2 * d_inner + 2 * n_groups * d_state + mamba_num_heads
+        mamba_in_proj_size = 0
+        mamba_inner_size = 0
+        mamba_head_dim = getattr(pretrained_config, 'mamba_head_dim', 0)
+        mamba_num_heads = getattr(pretrained_config, 'mamba_num_heads', 0)
+        if mamba_head_dim > 0 and mamba_num_heads > 0:
+            d_inner = mamba_head_dim * mamba_num_heads
+            mamba_inner_size = d_inner // mapping.tp_size
+            n_groups = getattr(pretrained_config, 'n_groups', 1)
+            d_state = getattr(pretrained_config, 'ssm_state_size', 128)
+            d_in_proj = 2 * d_inner + 2 * n_groups * d_state + mamba_num_heads
+            mamba_in_proj_size = d_in_proj // mapping.tp_size
+
+        # MoE latent size for latent MoE models (e.g., Nemotron-H SuperV3).
+        # Latent projections are replicated (not TP-sharded), so pass the
+        # raw config value without dividing by tp_size.
+        moe_latent_size = getattr(pretrained_config, 'moe_latent_size', 0) or 0
+
         # For MoE models with shared experts: replace mlp_* target modules with
         # shared_expert_* equivalents. The shared expert uses different LoRA
         # module types with their own intermediate size. For pure MoE models
@@ -1218,15 +1293,20 @@ def create_py_executor_instance(
             tp_size=mapping.tp_size,
             num_experts=num_experts,
             shared_expert_hidden_size=shared_expert_hidden_size,
-            moe_hidden_size=moe_hidden_size)
+            moe_hidden_size=moe_hidden_size,
+            mamba_in_proj_size=mamba_in_proj_size,
+            mamba_inner_size=mamba_inner_size,
+            moe_latent_size=moe_latent_size)
 
         model_binding_config.use_lora_plugin = True
         model_binding_config.lora_modules = lora_modules
         model_binding_config.max_lora_rank = lora_config.max_lora_rank
 
         max_lora_rank = lora_config.max_lora_rank
-        num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
-            len(target_modules + lora_config.missing_qkv_modules)
+        num_lora_modules = _compute_num_lora_modules(
+            pretrained_config,
+            target_modules + lora_config.missing_qkv_modules,
+        )
 
         peft_cache_config_model = PeftCacheConfig(
         ) if peft_cache_config is None else peft_cache_config
@@ -1325,7 +1405,7 @@ def create_py_executor_instance(
 
     # For hybrid models, this has both impl and mamba_impl
     mamba_cache_manager = None
-    if isinstance(kv_cache_manager, MambaHybridCacheManager):
+    if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
     kv_cache_transceiver = create_kv_cache_transceiver(
@@ -1360,7 +1440,9 @@ def create_py_executor_instance(
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
-        waiting_queue_policy=waiting_queue_policy)
+        waiting_queue_policy=waiting_queue_policy,
+        dwdp_manager=dwdp_manager,
+    )
 
 
 def create_torch_sampler_args(
@@ -1430,9 +1512,10 @@ def instantiate_sampler(
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
-    if llm_args.sampler_type == SamplerType.TRTLLMSampler or (
-            llm_args.sampler_type == SamplerType.auto
-            and decoding_mode.isBeamSearch()):
+    if llm_args.sampler_type == SamplerType.TRTLLMSampler:
+        logger.warning(
+            "TRTLLMSampler is deprecated and will be removed in release 1.4. Please use TorchSampler instead."
+        )
         logger.debug(f"DecodingMode: {decoding_mode.name}")
         return TRTLLMSampler(engine.model,
                              engine.dtype,
@@ -1472,6 +1555,69 @@ def get_decoding_mode(
         decoding_mode = DecodingMode.TopKTopP()
 
     return decoding_mode
+
+
+_ATTN_MODULES = frozenset({
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_qkv",
+    "attn_dense",
+    "cross_attn_q",
+    "cross_attn_k",
+    "cross_attn_v",
+})
+_MLP_MODULES = frozenset({
+    "mlp_h_to_4h",
+    "mlp_4h_to_h",
+    "mlp_gate",
+    "mlp_gate_up",
+})
+
+
+def _compute_num_lora_modules(pretrained_config,
+                              all_target_modules: list[str]) -> int:
+    """Compute the total number of LoRA module-layer slots for cache sizing.
+
+    For models with per-layer block_configs (e.g. Nemotron-NAS / DeciLM),
+    layers with no_op or replace_with_linear attention/FFN cannot host LoRA
+    adapters, so they are excluded from the count.  For all other models,
+    falls back to the uniform num_hidden_layers x len(target_modules).
+    """
+    num_layers = pretrained_config.num_hidden_layers
+    block_configs = getattr(pretrained_config, "block_configs", None)
+
+    if block_configs is None:
+        return num_layers * len(all_target_modules)
+
+    attn_modules = [m for m in all_target_modules if m in _ATTN_MODULES]
+    mlp_modules = [m for m in all_target_modules if m in _MLP_MODULES]
+    other_modules = [
+        m for m in all_target_modules
+        if m not in _ATTN_MODULES and m not in _MLP_MODULES
+    ]
+
+    def _has_lora_capable_attn(bc):
+        return not bc.attention.no_op and not bc.attention.replace_with_linear
+
+    def _has_lora_capable_ffn(bc):
+        return not bc.ffn.no_op and not bc.ffn.replace_with_linear
+
+    layers_with_attn = sum(1 for bc in block_configs
+                           if _has_lora_capable_attn(bc))
+    layers_with_mlp = sum(1 for bc in block_configs
+                          if _has_lora_capable_ffn(bc))
+
+    total = (layers_with_attn * len(attn_modules) +
+             layers_with_mlp * len(mlp_modules) +
+             num_layers * len(other_modules))
+
+    logger.info(f"LoRA module-layer count: {total} "
+                f"(attn: {layers_with_attn}x{len(attn_modules)}, "
+                f"mlp: {layers_with_mlp}x{len(mlp_modules)}, "
+                f"other: {num_layers}x{len(other_modules)}, "
+                f"uniform would be {num_layers * len(all_target_modules)})")
+    return total
 
 
 def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
